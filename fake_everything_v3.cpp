@@ -1,73 +1,111 @@
-/*
-    @author yuan
-
-    This program is used to search the files on your disk, it uses USN_JOURNAL_DATA just like the famous everything software.
-    A C++17 compiler is needed to compile this program.
-*/
 #define WIN32_LEAN_AND_MEAN
 
 #include <windows.h>
 #include <shellapi.h>
 #include <winioctl.h>
-#include <algorithm>
-#include <iostream>
-#include <memory>
-#include <string>
-#include <system_error>
-#include <functional>
-#include <utility>
-#include <vector>
-#include <map>
+
+#include <cstdio>
 #include <cstdlib>
-#include <cstdint>
 #include <cctype>
+#include <cstring>
+#include <cstdint>
 
-// encoding conversion, only for windows platform.
-namespace win_encoding {
-    std::string unicode_to_ascii(const std::wstring& wstr) {
-        int len = WideCharToMultiByte(CP_ACP, 0, wstr.c_str(), -1, nullptr, 0, nullptr, nullptr);
-        if (len == 0) {
-            throw std::system_error(GetLastError(), std::system_category(), "unicode to ascii failed");
+#include <string>
+#include <algorithm>
+#include <system_error>
+#include <vector>
+#include <memory>
+
+struct PathInfo {
+    DWORDLONG frn;   // file reference number.
+    DWORDLONG pfrn;  // parent file reference number.
+    std::wstring name;
+
+    PathInfo() = default;
+
+    PathInfo(DWORDLONG _frn, DWORDLONG _pfrn, const std::wstring& _name)
+        : frn{ _frn }, pfrn{ _pfrn }, name{ _name }
+    {}
+};
+
+class WinHandle {
+    HANDLE hnd;
+public:
+    WinHandle() : hnd{ INVALID_HANDLE_VALUE } {}
+
+    ~WinHandle() {
+        if (hnd != INVALID_HANDLE_VALUE) {
+            CloseHandle(hnd);
+        }
+    }
+
+    WinHandle(const WinHandle&) = delete;
+    WinHandle& operator=(const WinHandle&) = delete;
+
+    WinHandle(WinHandle&& other) noexcept : hnd{ other.hnd } {
+        other.hnd = INVALID_HANDLE_VALUE;
+    }
+
+    WinHandle& operator=(WinHandle&& other) noexcept {
+        if (this != &other) {
+            close();
+
+            hnd = other.hnd;
+            other.hnd = INVALID_HANDLE_VALUE;
         }
 
-        auto buf = std::make_unique<char[]>(len);
+        return *this;
+    }
 
-        len = WideCharToMultiByte(CP_ACP, 0, wstr.c_str(), -1, buf.get(), len, nullptr, nullptr);
-        if (len == 0) {
-            throw std::system_error(GetLastError(), std::system_category(), "unicode to ascii failed");
+    HANDLE get() const noexcept {
+        return hnd;
+    }
+
+    void set(HANDLE _hnd) {
+        close();
+        hnd = _hnd;
+    }
+
+    void close() {
+        if (hnd != INVALID_HANDLE_VALUE) {
+            CloseHandle(hnd);
         }
-
-        return std::string(buf.get());
     }
 };
 
-using PathDatabase = std::map<DWORDLONG, std::pair<std::wstring, DWORDLONG>>;
-using SearchCallback = std::function<void(const std::wstring&)>;
+class VolumeData {
+    WinHandle handle;
+    std::wstring volume;
+    std::vector<PathInfo> database;   // for this case, a vector takes less memory, and much faster than map.
+    bool _valid;
 
-class PathDataBuilder {
-    HANDLE handle;
-    USN_JOURNAL_DATA ujd;
-public:
-    PathDataBuilder(const std::wstring& volume) {
+    std::error_code get_last_system_error_code() {
+        return std::error_code{ (int)GetLastError(), std::system_category() };
+    }
+
+    HANDLE open_volume() {
         std::wstring temp = L"\\\\.\\" + volume;
-        handle = CreateFileW(temp.c_str(),
-            GENERIC_READ | GENERIC_WRITE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            nullptr,
-            OPEN_EXISTING,
-            0,
-            nullptr);
+        HANDLE hnd = CreateFileW(temp.c_str(),
+                                GENERIC_READ | GENERIC_WRITE,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                nullptr,
+                                OPEN_EXISTING,
+                                0,
+                                nullptr);
 
-        if (handle == INVALID_HANDLE_VALUE) {
-            throw std::system_error(GetLastError(), std::system_category(), "CreateFileW failed");
+        if (hnd == INVALID_HANDLE_VALUE) {
+            auto ec = get_last_system_error_code();
+            fprintf(stderr, "%d: sys call failed, %d, %s\n", __LINE__, ec.value(), ec.message().c_str());
         }
 
-        // create ujd.
-        USN_JOURNAL_DATA ujd;
-        CREATE_USN_JOURNAL_DATA cujd;
+        return hnd;
+    }
+
+    bool create_usn_journal() {
+        CREATE_USN_JOURNAL_DATA cujd{};
         DWORD bytes_returned;
 
-        bool result = DeviceIoControl(handle,
+        bool result = DeviceIoControl(handle.get(),
             FSCTL_CREATE_USN_JOURNAL,
             &cujd,
             sizeof(cujd),
@@ -77,46 +115,16 @@ public:
             nullptr);
 
         if (!result) {
-            auto err = GetLastError();
-            CloseHandle(handle);
-            handle = INVALID_HANDLE_VALUE;
-            throw std::system_error(err, std::system_category(), "DeviceIoControl CREATE failed");
-        }
-    }
-
-    ~PathDataBuilder() {
-        if (handle != INVALID_HANDLE_VALUE) {
-            CloseHandle(handle);
+            auto ec = get_last_system_error_code();
+            fprintf(stderr, "%d: sys call failed, %d, %s\n", __LINE__, ec.value(), ec.message().c_str());
         }
 
-        DELETE_USN_JOURNAL_DATA dujd = { ujd.UsnJournalID, USN_DELETE_FLAG_DELETE };
-        DWORD bytes_returned;
-
-        DeviceIoControl(handle,
-            FSCTL_DELETE_USN_JOURNAL,
-            &dujd,
-            sizeof(dujd),
-            nullptr,
-            0,
-            &bytes_returned,
-            nullptr);
+        return result;
     }
 
-    void build(PathDatabase& db) {
-        const uint32_t bufSize = 1024 * 1024;
-        auto buf = std::make_unique<char[]>(bufSize);
-
-#ifdef _MSC_VER
-        MFT_ENUM_DATA_V0 med = { 0, 0, ujd.NextUsn };
-#else
-        MFT_ENUM_DATA med = { 0, 0, ujd.NextUsn };
-#endif
-
-        // begin query.
+    bool query_usn_journal(USN_JOURNAL_DATA& ujd) {
         DWORD bytes_returned = 0;
-        bool result;
-
-        result = DeviceIoControl(handle,
+        bool result = DeviceIoControl(handle.get(),
             FSCTL_QUERY_USN_JOURNAL,
             nullptr,
             0,
@@ -126,28 +134,45 @@ public:
             nullptr);
 
         if (!result) {
-            throw std::system_error(GetLastError(), std::system_category(), "DeviceIoControl QUERY failed");
+            auto ec = get_last_system_error_code();
+            fprintf(stderr, "%d: sys call failed, %d, %s\n", __LINE__, ec.value(), ec.message().c_str());
         }
 
-        // fill db.
+        return result;
+    }
+
+    bool enum_usn_data(USN_JOURNAL_DATA& ujd) {
+        const uint32_t buf_size = 1024 * 1024;
+        auto buf = std::make_unique<char[]>(buf_size);
+
+#ifdef _MSC_VER
+        MFT_ENUM_DATA_V0 med = { 0, 0, ujd.NextUsn };
+#else
+        MFT_ENUM_DATA med = { 0, 0, ujd.NextUsn };
+#endif
+
+        DWORD bytes_returned = 0;
+
         while (true) {
-            bool result = DeviceIoControl(handle,
-                FSCTL_ENUM_USN_DATA,
-                (LPVOID)&med,
-                (DWORD)sizeof(med),
-                (LPVOID)buf.get(),
-                bufSize,
-                (LPDWORD)&bytes_returned,
-                nullptr);
+            bool result = DeviceIoControl(handle.get(),
+                                        FSCTL_ENUM_USN_DATA,
+                                        (LPVOID)&med,
+                                        (DWORD)sizeof(med),
+                                        (LPVOID)buf.get(),
+                                        buf_size,
+                                        (LPDWORD)&bytes_returned,
+                                        nullptr);
 
             if (!result) {
                 DWORD err = GetLastError();
 
                 if (err == ERROR_HANDLE_EOF) {
-                    return;
+                    break;
                 }
                 else {
-                    throw std::system_error(err, std::system_category(), "DeviceIoControl ENUM failed");
+                    auto ec = get_last_system_error_code();
+                    fprintf(stderr, "%d: sys call failed, %d, %s\n", __LINE__, ec.value(), ec.message().c_str());
+                    return false;
                 }
             }
 
@@ -155,68 +180,142 @@ public:
             PUSN_RECORD rec = (PUSN_RECORD)((PCHAR)buf.get() + sizeof(USN));
 
             while (bytes_returned > 0) {
-                DWORDLONG fileReferenceNumber = rec->FileReferenceNumber;
-                DWORDLONG parentFileReferenceNumber = rec->ParentFileReferenceNumber;
                 std::wstring name(rec->FileName, rec->FileNameLength / 2);
+                database.emplace_back(rec->FileReferenceNumber, rec->ParentFileReferenceNumber, name);
 
-                db.emplace(fileReferenceNumber, std::make_pair(name, parentFileReferenceNumber));
                 bytes_returned -= rec->RecordLength;
                 rec = (PUSN_RECORD)((PCHAR)rec + rec->RecordLength);
             }
 
             med.StartFileReferenceNumber = *(USN*)(&buf[0]);
         }
+
+        // after the collection, just sort them, then we could use binary search.
+        std::sort(database.begin(), database.end(), [](const PathInfo& left, const PathInfo& right) -> bool {
+            return left.frn < right.frn;
+        });
+
+        return true;
     }
-};
 
-class SearchEngine {
-    std::wstring volume;
-    PathDatabase db;
+    std::vector<PathInfo>::iterator database_binary_search(DWORDLONG target) {
+        auto iter = std::lower_bound(database.begin(), database.end(), target, [](const PathInfo& info, DWORDLONG frn) {
+            return info.frn < frn;
+        });
 
-    std::wstring get_absolute_name_by_reference_number(DWORDLONG number) noexcept {
-        DWORDLONG parentNumber = db[number].second;
-        std::wstring temp = db[number].first;
-
-        // concatenate the complete path.
-        while (db.count(parentNumber) > 0) {
-            temp = db[parentNumber].first + L"\\" + temp;
-            parentNumber = db[parentNumber].second;
+        if (iter != database.end() && iter->frn == target) {
+            return iter;
         }
+        else {
+            return database.end();
+        }
+    }
 
-        return volume + L"\\" + temp;
+    std::wstring get_absolute_name_by_reference_number(DWORDLONG number) {
+        auto iter = database_binary_search(number);
+
+        if (iter == database.end()) {
+            return L"";
+        }
+        else {
+            DWORDLONG parentNumber = iter->pfrn;
+            std::wstring temp = iter->name;
+
+            // concatenate the complete path.
+            while ((iter = database_binary_search(parentNumber)) != database.end()) {
+                temp = iter->name + L"\\" + temp;
+                parentNumber = iter->pfrn;
+            }
+
+            return volume + L"\\" + temp;
+        }
     }
 public:
-    SearchEngine(const std::wstring& _volume) : volume { _volume } {
-        PathDataBuilder builder{ volume };
-        builder.build(db);
+    VolumeData() : volume{ L"" }, database{}, _valid{ false } {
+        database.reserve(65536);
     }
 
-    void search(const std::wstring& pattern, bool ignoreCase, SearchCallback callback) noexcept {
-        if (ignoreCase) {
-            auto searchLambda = [](wchar_t a, wchar_t b) -> bool {
+    bool build_databse(const std::wstring& _volume) {
+        volume = _volume;
+
+        HANDLE hnd = open_volume();
+        if (hnd == INVALID_HANDLE_VALUE) {
+            return false;
+        }
+
+        handle.set(hnd);
+
+        if (!create_usn_journal()) {
+            return false;
+        }
+
+        USN_JOURNAL_DATA ujd;
+
+        if (!query_usn_journal(ujd)) {
+            return false;
+        }
+
+        if (!enum_usn_data(ujd)) {
+            return false;
+        }
+
+        handle.close();
+
+        _valid = true;
+        return _valid;
+    }
+
+    bool is_valid() const noexcept {
+        return _valid;
+    }
+
+    std::vector<std::wstring> query(const std::wstring& pattern) noexcept {
+        std::vector<std::wstring> result;
+
+        if (!is_valid()) {
+            return result;
+        }
+
+        for (const auto& entry : database) {
+            if (entry.name.find(pattern) != std::wstring::npos) {
+                result.emplace_back(get_absolute_name_by_reference_number(entry.frn));
+            }
+        }
+
+        return result;
+    }
+
+    std::vector<std::wstring> query_ignore_case(const std::wstring& pattern) noexcept {
+        std::vector<std::wstring> result;
+
+        if (!is_valid()) {
+            return result;
+        }
+
+        auto ignoreCaseLambda = [](wchar_t a, wchar_t b) -> bool {
                 return std::tolower(a) == std::tolower(b);
                 };
 
-            for (const auto& entry : db) {
-                auto& [name, number] = entry.second;
-                auto searchResult = std::search(name.begin(), name.end(), pattern.begin(), pattern.end(), searchLambda);
+        for (const auto& entry : database) {
+            const auto& name = entry.name;
+            auto searchRet = std::search(name.cbegin(), name.cend(), pattern.cbegin(), pattern.cend(), ignoreCaseLambda);
 
-                if (searchResult != name.end()) {
-                    callback(get_absolute_name_by_reference_number(entry.first));
-                }
+            if (searchRet != name.cend()) {
+                result.emplace_back(get_absolute_name_by_reference_number(entry.frn));
             }
         }
-        else {
-            for (const auto& entry : db) {
-                auto& [name, number] = entry.second;
 
-                if (name.find(pattern) != std::wstring::npos) {
-                    callback(get_absolute_name_by_reference_number(entry.first));
-                }
-            }
-        }
+        return result;
     }
 };
+
+bool is_ntfs(const std::wstring& path) {
+    wchar_t buf[MAX_PATH];
+    std::wstring temp = path + L"\\";
+
+    bool result = GetVolumeInformationW(temp.c_str(), nullptr, 0, nullptr, nullptr, nullptr, buf, MAX_PATH);
+    return result && wcscmp(buf, L"NTFS") == 0;
+}
 
 bool is_running_as_admin() {
     BOOL isAdmin = false;
@@ -245,7 +344,10 @@ bool is_running_as_admin() {
 
 bool start_as_admin() {
     wchar_t modulePath[MAX_PATH];
-    GetModuleFileNameW(nullptr, modulePath, MAX_PATH);
+    
+    if (GetModuleFileNameW(nullptr, modulePath, MAX_PATH) == 0) {
+        return false;
+    }
     
     SHELLEXECUTEINFOW shellInfo = { 0 };
     shellInfo.cbSize = sizeof(SHELLEXECUTEINFOW);
@@ -255,7 +357,6 @@ bool start_as_admin() {
     shellInfo.fMask = SEE_MASK_NOCLOSEPROCESS;
     
     if (ShellExecuteExW(&shellInfo)) {
-        WaitForSingleObject(shellInfo.hProcess, 2000);
         CloseHandle(shellInfo.hProcess);
         return true;
     }
@@ -263,36 +364,47 @@ bool start_as_admin() {
     return false;
 }
 
-bool is_ntfs(const std::wstring& volume) {
-    wchar_t buf[MAX_PATH];
-    std::wstring temp = volume + L"\\";
+std::string unicode_to_ascii(const std::wstring& wstr) {
+    int len = WideCharToMultiByte(CP_ACP, 0, wstr.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (len == 0) {
+        return "";
+    }
 
-    bool result = GetVolumeInformationW(temp.c_str(), nullptr, 0, nullptr, nullptr, nullptr, buf, MAX_PATH);
-    return result && wcscmp(buf, L"NTFS") == 0;
+    auto buf = std::make_unique<char[]>(len);
+    WideCharToMultiByte(CP_ACP, 0, wstr.c_str(), -1, buf.get(), len, nullptr, nullptr);
+    return std::string(buf.get());
 }
 
 void search_one_volume(const std::wstring& volume, const std::wstring& pattern, bool ignoreCase) {
     if (!is_ntfs(volume)) {
-        std::cerr << win_encoding::unicode_to_ascii(volume) << " is not NTFS\n";
+        fprintf(stderr, "volume: %s is not NTFS\n", unicode_to_ascii(volume).c_str());
         return;
     }
 
-    try {
-        SearchEngine se{ volume };
-
-        se.search(pattern, ignoreCase, [](const std::wstring& wstr){
-            std::cout << win_encoding::unicode_to_ascii(wstr) << "\n";
-        });
+    VolumeData vd;
+    if (!vd.build_databse(volume)) {
+        fprintf(stderr, "volume: %s build database failed\n", unicode_to_ascii(volume).c_str());
+        return;
     }
-    catch(const std::system_error& e) {
-        std::cerr << win_encoding::unicode_to_ascii(volume) << ", " << e.code() << ", " << e.what() << "\n";
+
+    std::vector<std::wstring> result;
+
+    if (ignoreCase) {
+        result = vd.query_ignore_case(pattern);
+    }
+    else {
+        result = vd.query(pattern);
+    }
+
+    for (const std::wstring& wstr : result) {
+        printf("%s\n", unicode_to_ascii(wstr).c_str());
     }
 }
 
 int main() {
     if (!is_running_as_admin()) {
         if (!start_as_admin()) {
-            std::cerr << "not admin, cannot execute!\n";
+            fprintf(stderr, "not admin, cannot execute!\n");
             return 1;
         }
 
@@ -300,8 +412,8 @@ int main() {
         return 0;
     }
 
-    search_one_volume(L"C:", L"miku", true);
-    search_one_volume(L"D:", L"miku", true);
+    search_one_volume(L"C:", L"芬妮", true);
+    search_one_volume(L"D:", L"爱莉", true);
     system("pause");
     return 0;
 }
